@@ -102,6 +102,8 @@ from .transformer import (
     TransformerLayer,
 )
 
+from .dysample import DySample
+
 __all__ = (
     "Conv",
     "Conv2",
@@ -179,4 +181,5 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "DySample",
 )
