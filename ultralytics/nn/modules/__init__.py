@@ -104,6 +104,13 @@ from .transformer import (
 
 from .dysample import DySample
 
+from .lsod_layers import (
+    LargeKernelAttention,
+    SPPFL,
+    C2fN,
+    NAM,
+)
+
 __all__ = (
     "Conv",
     "Conv2",
@@ -182,4 +189,8 @@ __all__ = (
     "Index",
     "A2C2f",
     "DySample",
+    "LargeKernelAttention",
+    "SPPFL",
+    "C2fN",
+    "NAM",
 )
