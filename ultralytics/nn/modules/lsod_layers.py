@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .conv import Conv  # Ultralytics標準Conv利用（=CBS）
+from .block import Bottleneck
+from .block import C2f, C3k
 
 class LargeKernelAttention(nn.Module):
     """Lightweight Large-Kernel Attention (LSKA)."""
@@ -17,33 +19,27 @@ class LargeKernelAttention(nn.Module):
 
 
 class SPPFL(nn.Module):
-    """SPPF with Large-Kernel Attention (used in LSOD-YOLO)."""
+    """SPPF with Lightweight Large-Kernel Attention (LSKA) — per LSOD-YOLO."""
 
     def __init__(self, c1: int, c2: int, k: int = 5):
         super().__init__()
-        c_ = c1 // 2  # hidden channels
+        c_ = c1 // 2
         self.cv1 = Conv(c1, c_, 1, 1)
-        # ★ Pooling kernels拡張
-        self.m5 = nn.MaxPool2d(5, 1, 2)
-        self.m7 = nn.MaxPool2d(7, 1, 3)
-        self.m9 = nn.MaxPool2d(9, 1, 4)
-        # ★ Attention追加
-        self.attn = LargeKernelAttention(c_)
         self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        self.attn = LargeKernelAttention(c_)  # only addition
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.cv1(x)
-        p5 = self.m5(y)
-        p7 = self.m7(y)
-        p9 = self.m9(y)
+        # original SPPF pooling stack (same tensor repeatedly pooled)
+        y1 = self.m(y)
+        y2 = self.m(y1)
+        y3 = self.m(y2)
+        # concatenate + apply LKA to the reduced feature
         att = self.attn(y)
-        return self.cv2(torch.cat([y, p5, p7, p9], 1) + att)
+        return self.cv2(torch.cat([y, y1, y2, y3], 1) + att)
 
 
-
-# -----------------------------
-# Normalized Attention Module (NAM)
-# -----------------------------
 class NAM(nn.Module):
     """
     Normalized Attention Module (NAM)
@@ -77,33 +73,39 @@ class NAM(nn.Module):
         return x * spatial
 
 
-# -----------------------------
-# C2f-N: C2f with NAM
-# -----------------------------
 class C2fN(nn.Module):
-    """
-    C2f-N: Modified C2f block with Normalized Attention Module.
-    """
+    """C2f-N: Modified C2f block with Normalized Attention Module (NAM)."""
 
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, reduction=16):
         super().__init__()
-        self.c = int(c2 * e)
+        self.c = int(c2 * e)  # hidden channels
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        # 🔸 Use Bottleneck as in original C2f
         self.m = nn.ModuleList(
-            nn.Sequential(
-                Conv(self.c, self.c, 3, 1, g=g),
-                nn.BatchNorm2d(self.c),
-                nn.SiLU(),
-            )
+            Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0)
             for _ in range(n)
         )
         self.nam = NAM(c2, reduction=reduction)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = list(self.cv1(x).chunk(2, 1))  # split input
+        y.extend(m(y[-1]) for m in self.m) # process through Bottlenecks
+        out = self.cv2(torch.cat(y, 1))    # fuse partial + processed
+        return self.nam(out)               # apply attention after fusion
+    
+
+class C3k2N(C2f):
+    """C3k2 with Normalization-based Attention (NAM)."""
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g)
+            for _ in range(n)
+        )
+        self.nam = NAM(self.c)  # ← 追加（C2f-N と同じ原理）
+
     def forward(self, x):
-        y = list(self.cv1(x).chunk(2, 1))
-        for m in self.m:
-            y.append(m(y[-1]))
-        out = self.cv2(torch.cat(y, 1))
-        return self.nam(out)
+        y = super().forward(x)
+        return self.nam(y)  # NAM によるチャネル＋空間リウェイト
 
