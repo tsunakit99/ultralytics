@@ -1,0 +1,59 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# LSOD-YOLO (Expert Systems 2025)
+# Lightweight Small Object Detection YOLO model with DySample, LCOR, and NAM
+# Author: Taiga Sunamoto (tsunakit99)
+# Docs: https://docs.ultralytics.com/models/yolov8
+# Paper: https://www.mdpi.com/2076-3417/15/7/3961
+
+# Parameters
+nc: 80  # number of classes
+scales:  # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.33, 0.25, 1024]  # LSOD-YOLO-N: lightweight (≈8.9 GFLOPS)
+  s: [0.33, 0.50, 1024]  # LSOD-YOLO-S: small (≈28.8 GFLOPS)
+  m: [0.67, 0.75, 768]   # LSOD-YOLO-M: medium (≈79.3 GFLOPS)
+  l: [1.00, 1.00, 512]   # LSOD-YOLO-L: large (≈165.7 GFLOPS)
+  x: [1.00, 1.25, 512]   # LSOD-YOLO-X: extra-large (≈258.5 GFLOPS)
+
+# --------------------------------------------------------
+# Backbone
+# --------------------------------------------------------
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]       # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]      # 1-P2/4
+  - [-1, 3, C2f, [128, True]]      # 2-P2
+  - [-1, 1, Conv, [256, 3, 2]]      # 3-P3/8
+  - [-1, 6, C2f, [256, True]]      # 4-P3
+  - [-1, 1, Conv, [512, 3, 2]]      # 5-P4/16
+  - [-1, 6, C2f, [512, True]]      # 6-P4
+  - [-1, 1, SPPFL, [512, 5]]       # 7-SPPFL output (40×40×512)
+
+# --------------------------------------------------------
+# Neck
+# --------------------------------------------------------
+head:
+  # ---- Top-down path (DySample + P3 fusion)
+  - [-1, 1, DySample, [512, 2]]        # 8: 40x40→80x80
+  - [[-1, 4], 1, Concat, [1]]          # 9: DySample + P3
+  - [-1, 3, C2fN, [256]]               # 10: C2f-N block @ P3 (80x80)
+
+  # ---- Further upsample + P2 fusion
+  - [-1, 1, DySample, [256, 2]]        # 11: 80x80→160x160
+  - [[-1, 2], 1, Concat, [1]]          # 12: DySample + P2
+  - [-1, 3, C2fN, [128]]               # 13: C2f-N block @ P2 (160x160)
+  - [-1, 1, Conv, [256, 3, 2]]          # 14: downsample back to 80x80
+
+  # ---- Mid-level fusion (P3 skip + Downsample)
+  - [[14, 4, 10], 1, Concat, [1]]      # 15: (Conv↓2 + P3 + C2fN)
+  - [-1, 3, C2fN, [256]]               # 16: C2f-N block @ 80x80
+  - [-1, 1, Conv, [512, 3, 2]]          # 17: downsample to 40x40
+
+  # ---- Bottom-level fusion (SPPFL + Downsample)
+  - [[-1, 7], 1, Concat, [1]]          # 18: (Downsample + SPPFL)
+  - [-1, 3, C2fN, [512]]               # 19: C2f-N block @ 40x40
+
+  # --------------------------------------------------------
+  # Head (Detection layers)
+  # --------------------------------------------------------
+  - [[13, 16, 19], 1, Detect, [nc]]    # 20: Detect(P2, P3, P4)
