@@ -11,6 +11,14 @@ import torch
 import torch.nn as nn
 
 from ultralytics.nn.autobackend import check_class_names
+from ultralytics.nn.modules.lsod_layers import (
+    C3k2N,
+    C2fN,
+    SPPFL,
+    LargeSeparableKernelAttention,
+    NAM,
+)
+from ultralytics.nn.modules.dysample import DySample
 from ultralytics.nn.modules import (
     AIFI,
     C1,
@@ -1584,6 +1592,10 @@ def parse_model(d, ch, verbose=True):
             GhostBottleneck,
             SPP,
             SPPF,
+            SPPFL,
+            C3k2N,
+            C2fN,
+            DySample,
             C2fPSA,
             C2PSA,
             DWConv,
@@ -1618,7 +1630,9 @@ def parse_model(d, ch, verbose=True):
             C1,
             C2,
             C2f,
+            C2fN,
             C3k2,
+            C3k2N,
             C2fAttn,
             C3,
             C3TR,
@@ -1645,27 +1659,37 @@ def parse_model(d, ch, verbose=True):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
-            c1, c2 = ch[f], args[0]
-            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
-                c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
-                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+            if m is DySample:
+                c1 = ch[f]
+                c2 = ch[f]  # DySample preserves channel count
+                args = [c1, *args]
+            else:
+                c1, c2 = ch[f], args[0]
+                if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                    c2 = make_divisible(min(c2, max_channels) * width, 8)
+                if m is C2fAttn:  # set 1) embed channels and 2) num heads
+                    args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
+                    args[2] = int(
+                        max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2]
+                    )
 
-            args = [c1, c2, *args[1:]]
+                args = [c1, c2, *args[1:]]
             if m in repeat_modules:
-                args.insert(2, n)  # number of repeats
+                if m in {C2fN, C3k2N} and len(args) > 2:
+                    args[2] = n  # override internal repeat count
+                else:
+                    args.insert(2, n)  # number of repeats
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
-                legacy = False
-                if scale in "mlx":
-                    args[3] = True
-            if m is A2C2f:
-                legacy = False
-                if scale in "lx":  # for L/X sizes
-                    args.extend((True, 1.2))
-            if m is C2fCIB:
-                legacy = False
+                if m is C3k2:  # for M/L/X sizes
+                    legacy = False
+                    if scale in "mlx":
+                        args[3] = True
+                if m is A2C2f:
+                    legacy = False
+                    if scale in "lx":  # for L/X sizes
+                        args.extend((True, 1.2))
+                if m is C2fCIB:
+                    legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

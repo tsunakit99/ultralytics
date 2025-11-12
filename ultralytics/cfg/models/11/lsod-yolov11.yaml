@@ -1,5 +1,5 @@
 # LSOD-YOLOv11 🚀 (YOLOv11-based Lightweight Small Object Detection)
-# Derived from Ultralytics YOLOv11, with LCOR + SPPFL + C2f-N + Dysample integration
+# Derived from Ultralytics YOLOv11, with LCOR + SPPFL + C2f-N + DySample integration
 # Paper: "LSOD-YOLO: Lightweight Small Object Detection with Attention and Cross-Layer Optimization"
 # License: AGPL-3.0
 
@@ -29,20 +29,20 @@ backbone:
   - [-1, 2, C2PSA, [512]]      # 8 optional C2PSA
 
 # -----------------------------------------------------------------------------
-# ⚙️ Neck (LCOR + C2f-N + Dysample)
+# ⚙️ Neck (LCOR + C2f-N + DySample)
 # - Removes P5 detection branch (LCOR)
 # - Adds cross-layer concat from P3→Neck for small object focus
 # - C2f-N replaces normal C3k2 blocks (integrated NAM)
-# - Dysample module for lightweight dynamic upsampling
+# - DySample module for lightweight dynamic upsampling
 # -----------------------------------------------------------------------------
 head:
   # Upsample + LCOR skip connection from P4
-  - [-1, 1, Dysample, [512, 2]]     # 9: 40x40→80x80
+  - [-1, 1, DySample, [2]]     # 9: 40x40→80x80
   - [[-1, 4], 1, Concat, [1]]       # 10: DySample + P3
   - [-1, 2, C3k2N, [256]]           # 11: C3k2-NAM (80x80)
 
   # Upsample + LCOR skip connection from P3
-  - [-1, 1, Dysample, [256, 2]]    # 12: 80x80→160x160
+  - [-1, 1, DySample, [2]]    # 12: 80x80→160x160
   - [[-1, 2], 1, Concat, [1]]       # 13: DySample + P2
   - [-1, 2, C3k2N, [128]]           # 14: C3k2-NAM (160x160)
 

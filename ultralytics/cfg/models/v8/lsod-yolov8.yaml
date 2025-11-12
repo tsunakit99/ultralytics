@@ -34,24 +34,24 @@ backbone:
 # --------------------------------------------------------
 head:
   # ---- Top-down path (DySample + P3 fusion)
-  - [-1, 1, DySample, [512, 2]]        # 8: 40x40→80x80
+  - [-1, 1, DySample, [2]]        # 8: 40x40→80x80
   - [[-1, 4], 1, Concat, [1]]          # 9: DySample + P3
-  - [-1, 3, C2fN, [256]]               # 10: C2f-N block @ P3 (80x80)
+  - [-1, 3, C2fN, [256, 1, False]]               # 10: C2f-N block @ P3 (80x80)
 
   # ---- Further upsample + P2 fusion
-  - [-1, 1, DySample, [256, 2]]        # 11: 80x80→160x160
+  - [-1, 1, DySample, [2]]        # 11: 80x80→160x160
   - [[-1, 2], 1, Concat, [1]]          # 12: DySample + P2
-  - [-1, 3, C2fN, [128]]               # 13: C2f-N block @ P2 (160x160)
+  - [-1, 3, C2fN, [128, 1, False]]               # 13: C2f-N block @ P2 (160x160)
   - [-1, 1, Conv, [256, 3, 2]]          # 14: downsample back to 80x80
 
   # ---- Mid-level fusion (P3 skip + Downsample)
   - [[14, 4, 10], 1, Concat, [1]]      # 15: (Conv↓2 + P3 + C2fN)
-  - [-1, 3, C2fN, [256]]               # 16: C2f-N block @ 80x80
+  - [-1, 3, C2fN, [256, 1, False]]               # 16: C2f-N block @ 80x80
   - [-1, 1, Conv, [512, 3, 2]]          # 17: downsample to 40x40
 
   # ---- Bottom-level fusion (SPPFL + Downsample)
   - [[-1, 7], 1, Concat, [1]]          # 18: (Downsample + SPPFL)
-  - [-1, 3, C2fN, [512]]               # 19: C2f-N block @ 40x40
+  - [-1, 3, C2fN, [512, 1, False]]               # 19: C2f-N block @ 40x40
 
   # --------------------------------------------------------
   # Head (Detection layers)

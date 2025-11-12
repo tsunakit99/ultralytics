@@ -1,93 +1,128 @@
+# ultralytics/nn/modules/dysample.py
+# DySample (paper-faithful): lightweight dynamic upsampler
+# LSOD-YOLO: linear layer -> pixel shuffle -> offsets (2, sH, sW) -> grid_sample
+# Ref: "linear layer (out=2*s^2) + pixel shuffle" and sampling grid + offsets. 
+#      (No lp/pl, no groups). See Fig.7 and text. 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+__all__ = ["DySample"]
 
-def normal_init(module, mean=0, std=1, bias=0):
-    if hasattr(module, "weight") and module.weight is not None:
-        nn.init.normal_(module.weight, mean, std)
-    if hasattr(module, "bias") and module.bias is not None:
-        nn.init.constant_(module.bias, bias)
-
-
-def constant_init(module, val, bias=0):
-    if hasattr(module, "weight") and module.weight is not None:
-        nn.init.constant_(module.weight, val)
-    if hasattr(module, "bias") and module.bias is not None:
-        nn.init.constant_(module.bias, bias)
-
+def _normal_init(m, std=1e-3, bias=0.0):
+    if hasattr(m, "weight") and m.weight is not None:
+        nn.init.normal_(m.weight, mean=0.0, std=std)
+    if hasattr(m, "bias") and m.bias is not None:
+        nn.init.constant_(m.bias, bias)
 
 class DySample(nn.Module):
     """
-    Dynamic upsampling layer used in LSOD-YOLO (Expert Systems 2025).
-    Improves boundary accuracy and preserves fine-grained texture features.
+    Paper-faithful DySample:
+      - offset: 1x1 conv, out_channels = 2 * (scale**2)
+      - reshape offsets by pixel_shuffle -> (B, 2, sH, sW)
+      - coords = (G + O) normalized to [-1, 1]
+      - grid_sample(x, coords) to get upsampled features (C x sH x sW)
+    Notes:
+      * channels are preserved (in == out)
+      * no groups, no 'lp'/'pl' modes
     """
 
-    def __init__(self, in_channels, scale=2, style="lp", groups=4, dyscope=False):
+    def __init__(self, c1: int, scale: int = 2, use_scope: bool = False, alpha: float = 0.25):
+        """
+        Args:
+            c1: input channels (from Ultralytics parser as first arg)
+            scale: upsample factor (typically 2)
+            use_scope: optional gating conv for offsets (sigmoid), zeros init
+            alpha: scale factor for offset magnitude before adding base grid
+        """
         super().__init__()
+        assert isinstance(scale, int) and scale >= 2, "scale must be integer >= 2"
+
         self.scale = scale
-        self.style = style
-        self.groups = groups
-        assert style in ["lp", "pl"]
-        if style == "pl":
-            assert in_channels >= scale**2 and in_channels % scale**2 == 0
-        assert in_channels >= groups and in_channels % groups == 0
+        self.alpha = float(alpha)
 
-        if style == "pl":
-            in_channels = in_channels // scale**2
-            out_channels = 2 * groups
-        else:
-            out_channels = 2 * groups * scale**2
+        # 1x1 conv -> 2*s^2 channels (x/y offsets for each sub-pixel)
+        self.offset = nn.Conv2d(c1, 2 * (scale ** 2), kernel_size=1, bias=True)
+        _normal_init(self.offset, std=1e-3, bias=0.0)
 
-        self.offset = nn.Conv2d(in_channels, out_channels, 1)
-        normal_init(self.offset, std=0.001)
-        if dyscope:
-            self.scope = nn.Conv2d(in_channels, out_channels, 1, bias=False)
-            constant_init(self.scope, val=0.0)
+        self.scope = None
+        if use_scope:
+            # gating branch (sigmoid) as optional "dynamic factor" in the paper text
+            self.scope = nn.Conv2d(c1, 2 * (scale ** 2), kernel_size=1, bias=False)
+            with torch.no_grad():
+                # start as pass-through (all zeros -> sigmoid(0)=0.5, effectively halves offsets initially)
+                nn.init.constant_(self.scope.weight, 0.0)
 
-        self.register_buffer("init_pos", self._init_pos())
+        # precompute base grid offset (init_pos) of shape (1, 2*s^2, 1, 1) *after* shuffle becomes (1,2,1,1)
+        self.register_buffer("init_pos", self._make_init_pos(), persistent=False)
 
-    def _init_pos(self):
-        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
-        return torch.stack(torch.meshgrid([h, h])).transpose(1, 2).repeat(1, self.groups, 1).reshape(1, -1, 1, 1)
+    def _make_init_pos(self) -> torch.Tensor:
+        # static base grid offsets in range centered around 0 as in paper’s description
+        # Produce a (2, s, s) small grid, then reshape to (1, 2*s*s, 1, 1) to match conv output prior to shuffle.
+        s = self.scale
+        # coordinate centers in [-(s-1)/2, ..., +(s-1)/2] normalized by s
+        h = torch.arange((1 - s) / 2, (s - 1) / 2 + 1, dtype=torch.float32) / s
+        # meshgrid with ij indexing to avoid future warnings
+        yy, xx = torch.meshgrid(h, h, indexing="ij")  # (s, s)
+        base = torch.stack((xx, yy), dim=0)          # (2, s, s) with order (x, y)
+        base = base.reshape(1, 2 * s * s, 1, 1)      # (1, 2*s*s, 1, 1)
+        return base
 
-    def sample(self, x, offset):
-        B, _, H, W = offset.shape
-        offset = offset.view(B, 2, -1, H, W)
-        coords_h = torch.arange(H) + 0.5
-        coords_w = torch.arange(W) + 0.5
-        coords = torch.stack(torch.meshgrid([coords_w, coords_h])).transpose(1, 2).unsqueeze(1).unsqueeze(0).type(x.dtype).to(x.device)
-        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
-        coords = 2 * (coords + offset) / normalizer - 1
-        coords = F.pixel_shuffle(coords.view(B, -1, H, W), self.scale).view(
-            B, 2, -1, self.scale * H, self.scale * W).permute(0, 2, 3, 4, 1).contiguous().flatten(0, 1)
-        return F.grid_sample(
-            x.reshape(B * self.groups, -1, H, W), coords, mode="bilinear",
-            align_corners=False, padding_mode="border"
-        ).view(B, -1, self.scale * H, self.scale * W)
+    def _build_coords(self, H: int, W: int, device, dtype):
+        # Build normalized base grid in [-1,1] for size (sH, sW)
+        s = self.scale
+        # target spatial size
+        sH, sW = s * H, s * W
 
-    def forward_lp(self, x):
-        if hasattr(self, "scope"):
-            offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
-        else:
-            offset = self.offset(x) * 0.25 + self.init_pos
-        return self.sample(x, offset)
+        # pixel centers: [0.5, 1.5, ..., sH-0.5] / sW, sH (x,y)
+        y = torch.arange(sH, device=device, dtype=dtype) + 0.5
+        x = torch.arange(sW, device=device, dtype=dtype) + 0.5
+        # meshgrid with ij indexing: y first (rows), x second (cols)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")   # (sH, sW)
 
-    def forward_pl(self, x):
-        x_ = F.pixel_shuffle(x, self.scale)
-        if hasattr(self, "scope"):
-            offset = F.pixel_unshuffle(self.offset(x_) * self.scope(x_).sigmoid(), self.scale) * 0.5 + self.init_pos
-        else:
-            offset = F.pixel_unshuffle(self.offset(x_), self.scale) * 0.25 + self.init_pos
-        return self.sample(x, offset)
+        # normalize to [-1, 1]
+        # grid_sample expects last dim order (x, y) in [-1,1]
+        gx = 2.0 * (xx / sW) - 1.0
+        gy = 2.0 * (yy / sH) - 1.0
+        grid = torch.stack((gx, gy), dim=-1)  # (sH, sW, 2)
+        return grid
 
-    def forward(self, x):
-        if self.style == "pl":
-            return self.forward_pl(x)
-        return self.forward_lp(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            y: (B, C, sH, sW)
+        """
+        B, C, H, W = x.shape
+        s = self.scale
 
+        # raw offsets: (B, 2*s*s, H, W)
+        off = self.offset(x)
+        if self.scope is not None:
+            off = off * self.scope(x).sigmoid()  # gate
 
-if __name__ == "__main__":
-    x = torch.rand(2, 64, 4, 7)
-    dys = DySample(64)
-    print(dys(x).shape)
+        # add small static prior then magnitude scaling
+        # (B, 2*s*s, H, W) + (1, 2*s*s, 1, 1)
+        off = self.alpha * off + self.init_pos
+
+        # reshape offsets to (B, 2, sH, sW) via pixel shuffle
+        off = F.pixel_shuffle(off, upscale_factor=s)  # (B, 2, sH, sW)
+        # build base coordinates (normalized) and add normalized offsets
+        grid = self._build_coords(H, W, device=x.device, dtype=x.dtype)  # (sH, sW, 2)
+
+        # offsets are in absolute pixel units of sub-grid; normalize them to [-1,1]
+        # scale by (1/sW, 1/sH) and map to [-1,1] space
+        dx = (off[:, 0]) * (2.0 / (s * W))  # (B, sH, sW)
+        dy = (off[:, 1]) * (2.0 / (s * H))
+
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1).clone()  # (B, sH, sW, 2)
+        grid[..., 0] = torch.clamp(grid[..., 0] + dx, -1.0001, 1.0001)
+        grid[..., 1] = torch.clamp(grid[..., 1] + dy, -1.0001, 1.0001)
+
+        # sample
+        y = F.grid_sample(
+            x, grid, mode="bilinear", align_corners=False, padding_mode="border"
+        )  # (B, C, sH, sW)
+        return y
